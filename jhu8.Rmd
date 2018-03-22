@@ -1,0 +1,161 @@
+---
+title: "JHU Prediction Assignment - Machine Learning Course"
+author: "GJAllen"
+date: "March 21, 2018"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+### Synopsis
+
+* Fit some gbms using the xgboost package.
+* 10-fold cross validation
+* Throw all the variables in and let the gbm sort it out
++ Use regularization, shrinkage, and/or min_child_weight to limit overfitting
++ Terminate training based on holdout samples to limit overfitting
+* Do some hyperparameter tuning.
+
+### Attach useful packages and read in the data
+
+Note V1 is just the row index which partitions classe, so we need to remove it. There are also three time-related fields, two raw timestamp fields and a num_window field.  I'm not too sure what these fields are, so I am skeptical that predicting on them will generalize well out of sample, so I am going to remove them also. It could be that these are in fact the best predictors for our particular test set, but if the goal is to predict the class of error based on the motions of the experiments' motions, we don't really want to cheat anyway.
+
+There were separate sensors attached to three parts of the body as well as to the dumbbell.  Pitch, yaw, and roll are measured in degrees. We expect for example for the belt sensor readings to be particularly good at separating the class for hip mistakes from the others. We could look into intelligent ways to engineer features by combining these different measurements based on their spacial/physical relationships, but we won't.
+
+```{r}
+# For stratified sampling
+library(fifer, warn.conflicts = FALSE)
+# For fread
+library(data.table, warn.conflicts = FALSE)
+# For gbms
+library(xgboost, warn.conflicts = FALSE)
+# For data tidying
+suppressMessages(library(tidyverse, warn.conflicts = FALSE))
+# For %<>%
+library(magrittr, warn.conflicts = FALSE)
+pml.train <- fread("pml-training.csv", data.table = FALSE) %>% 
+  select(-V1, -raw_timestamp_part_1, -raw_timestamp_part_2, -num_window)
+```
+
+
+
+The classes are fairly balanced, which is useful since we won't need to worry about handling unbalanced classes as much.  This was by design of the experiment, where each participant completed 10 repetitions of each class of dumbbell curl (one correct to specification, the other four being different types of common mistakes). 
+
+```{r}
+prop.table(table(pml.train$classe))
+```
+
+Let's clean the data.  First, we know that all of the data should be represented in terms of numbers besides the classe factor.  Because we're not worried about memory, let's coerce all of the colums besides class to be numeric.
+
+```{r}
+suppressWarnings(pml.train %<>% mutate_at(1:155, as.numeric))
+```
+
+Now let's remove columns that contain almost exclusively missing values.
+```{r}
+is.na(pml.train) %>% 
+  colMeans %>% 
+  table
+```
+
+So 57 columns contain no missing values, while 67 columns contain ~ 98% or more missing values.  
+Let's just filter those out.
+
+```{r}
+pml.train <- pml.train[, which(colSums(is.na(pml.train)) == 0)]
+```
+
+### Model
+
+Let's start without worrying about hyperparameters - just using the default settings for any of the knobs we might like to tweak.  Begin by getting the data into a form that xgboost's training function can use.
+
+```{r}
+pml.dmatrix <- xgb.DMatrix(data = as.matrix(pml.train[, -53]),
+                           label = as.numeric(as.factor(pml.train$classe)) - 1)
+```
+
+We're going to set our shrinkage parameter, eta, relatively high for the initial models so that iteratively fitting models does not take too much time.
+
+```{r}
+set.seed(1)
+initial.cross.validation <- xgb.cv(params = list(objective = "multi:softprob", 
+                                                 eta = 0.1,
+                                                 eval_metric = "mlogloss",
+                                                 num_class = 5),
+                                   pml.dmatrix, 
+                                   nrounds = 1e7,
+                                   early_stopping_rounds = 5,
+                                   nfold = 10,
+                                   print_every_n = 60,
+                                   prediction = TRUE)
+```
+
+OK, let's look at the predictions.  We know that the rows index the classe, so we can just plot against the index.
+
+```{r}
+predicted.labels <- apply(initial.cross.validation$pred, 1, function(x) which(x == max(x)))
+plot(seq_along(predicted.labels), predicted.labels, cex = 0.5, pch = 19)
+```
+and let's look at the accuracy
+
+```{r}
+mean(predicted.labels == as.numeric(factor(pml.train$classe)))
+```
+
+OK, there are plenty of things we could've done differently, but this actually looks more than good enough, so let's call it quits and fit the final model to predict on the test set.
+
+#### Final model
+We still want a test set in order to determine when to end training. We want the biggest training set possible, but we want our test set classe distribution to be representative of the actual classe distribution, so let's use stratified sampling.
+
+```{r}
+pml.final <- stratified(pml.train, "classe", 0.8, bothSets = TRUE)
+train.xgb <- xgb.DMatrix(data = as.matrix(pml.final$SET1[, -53]),
+                         label = as.numeric(as.factor(pml.final$SET1$classe)) - 1)
+test.xgb <- xgb.DMatrix(data = as.matrix(pml.final$SET2[, -53]),
+                        label = as.numeric(as.factor(pml.final$SET2$classe)) - 1)
+```
+
+And fit the final model.
+
+```{r}
+final.gbm <- xgb.train(params = list(objective = "multi:softprob", 
+                                     eta = 0.1,
+                                     eval_metric = "mlogloss",
+                                     num_class = 5),
+                       train.xgb, 
+                       nrounds = 1e7,
+                       early_stopping_rounds = 5,
+                       nfold = 10,
+                       print_every_n = 60,
+                       watchlist = list(train = train.xgb, 
+                                        test = test.xgb))
+```
+
+Now let's do a sanity check on the quality of predictions on the test set
+
+```{r}
+predicted.labels <- predict(final.gbm, test.xgb, reshape = TRUE) %>% 
+  apply(1, function(x) LETTERS[which(x == max(x))])
+mean(predicted.labels == pml.final$SET2$classe)
+```
+
+Looks good.
+
+Final Predictions:
+```{r}
+pml.test <- fread("pml-testing.csv", data.table = FALSE) %>% 
+  .[, setdiff(names(pml.train), "classe")] %>% 
+  mutate_all(as.numeric) %>% 
+  as.matrix %>% 
+  xgb.DMatrix()
+
+predict(final.gbm, pml.test, reshape = TRUE) %>% 
+  apply(1, function(x) LETTERS[which(x == max(x))])
+```
+
