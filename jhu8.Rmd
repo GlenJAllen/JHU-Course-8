@@ -18,8 +18,8 @@ knitr::opts_chunk$set(echo = TRUE)
 * Fit some gbms using the xgboost package.
 * 10-fold cross validation
 * Throw all the variables in and let the gbm sort it out
-+ Use regularization, shrinkage, and/or min_child_weight to limit overfitting
-+ Terminate training based on holdout samples to limit overfitting
+    + Use regularization, shrinkage, and/or min_child_weight to limit overfitting
+    + Terminate training based on holdout samples to limit overfitting
 * Do some hyperparameter tuning.
 
 ### Attach useful packages and read in the data
